@@ -9,6 +9,9 @@
 #include <zephyr/drivers/gpio.h>
 #include <math.h>
 #include <zephyr/sys/util.h>
+#include <ti/driverlib/dl_dma.h>
+#include <ti/driverlib/dl_timera.h>
+#include <ti/driverlib/dl_mathacl.h>
 
 #define ZEPHYR_USER_NODE DT_PATH(zephyr_user)
 #define SPI_1_NODE	DT_NODELABEL(spi1)
@@ -19,6 +22,7 @@
 #define FULL_SCALE 5
 #define MAX_NUM pow(2,NUM_BITS)
 #define SPI_PACKET_SIZE 4
+#define SAC_MASK 0x000000000000FFFF
 
 const struct gpio_dt_spec reset = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, reset_gpios);
 const struct gpio_dt_spec start = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, start_gpios);
@@ -30,6 +34,7 @@ const struct device *const dev = DEVICE_DT_GET(SPI_1_NODE);
 struct spi_cs_control cs_ctrl = (struct spi_cs_control){
 	.gpio = GPIO_DT_SPEC_GET(SPI_1_NODE, cs_gpios),
 	.delay = 0u,
+
 };
 
 uint8_t spiData[SPI_PACKET_SIZE] = {0x0,0x0,0x0,0x0};
@@ -41,9 +46,18 @@ int sampleCounter;
 int32_t vMIN, vMAX, VDC, pk_pk,	vRMS;
 int32_t dataOutput[5] ;//= {0,0,0,0,0};
 
-int64_t sacSum, sumSAMP;
+int64_t sacSum, sumSAMP, sacRes1, sacRes2;
 
 bool  dataReady;
+
+const DL_MathACL_operationConfig gMACConfig = {
+	.opType = MATHACL_CTL_FUNC_MAC,
+	.opSign = DL_MATHACL_OPSIGN_SIGNED,
+	.iterations = 1,
+	.scaleFactor = 0,
+	.qType = DL_MATHACL_Q_TYPE_Q16
+};
+
 
 static struct gpio_callback drdy_cb_data;
 
@@ -133,6 +147,7 @@ void resetVars(void){
 	sacSum  = 0;
 	pk_pk 	= 0;
 	sampleCounter = NUM_SAMPLES;
+//	sacRes1 = 0;
 }
 
 void calculateResult(void){
@@ -160,11 +175,12 @@ void drdyEdge(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 	dataReady = true;
 	SPI_TRX(dev, &cs_ctrl, spiData);  // get data from the ADC and send to buffer
 }
+
 int main(void){
 
 	int ret;
 	sampleCounter = NUM_SAMPLES; 	// set initial sample window count
-
+	uint16_t rnd ;
 	dataReady = false; 				// intially set this low until ADC is active and data is ready
 
 	if (!device_is_ready(dev)) {
@@ -194,42 +210,83 @@ int main(void){
 			return 0;
 		}
 
+		DL_MathACL_clearResults(MATHACL);
 
 	//gpio_pin_set_dt(&en, 1);
 	adcSetup();
 
 	gpio_init_callback(&drdy_cb_data, drdyEdge, BIT(drdy.pin));
 	gpio_add_callback(drdy.port, &drdy_cb_data);
-	printk("Set up DRDY at %s %d\n", drdy.port->name, drdy.pin);
 
-	setSTART(true);
 	while (1) {
+		rnd = rand() % 4096 + 1;
 
 		if (sampleCounter > 0) { 			// Have we collected all samples in window?
-			if(dataReady){ 					// wait for data to be ready from the ADC
-				dataReady = false;			// reset until callback indicates data is ready
 
-				cSample = adcRX; 			// push uint16_t sample value from callback into local buffer
+				cSample = rnd; 				// push uint16_t sample value from callback into local buffer
 				sumSAMP += cSample; 		// add value to total sum for this window
 				sampleCounter--;            // decrement the sample count
-				sacSum = sacSum + (cSample * cSample);
 
-				if(cSample> vMAX){          // Set min and max values based on samples we have already taken
-					vMAX = cSample;
-				}else if(cSample<vMIN){
-					vMIN = cSample;
-				}
-			} else{ //............		    //do nothing since data is not ready yet
-			  }
-		} else{
 
-			setSTART(false);				// now we have all samples, stop ADC sampling
-			calculateResult();				// calculate results to be sent to display
-			resetVars(); 					// Reset the variable values for next iteration
-			k_sleep(K_MSEC(10000));
-			setSTART(true); 				// Set up ADC for next window of sampling
-			gpio_pin_set_dt(&done, 0);
+				DL_MathACL_waitForOperation(MATHACL);
+				DL_MathACL_configOperation(MATHACL, &gMACConfig, cSample, cSample);
+				DL_MathACL_waitForOperation(MATHACL);
+
+				sacRes1 = DL_MathACL_getResultOne(MATHACL);
+				sacRes2 = DL_MathACL_getResultTwo(MATHACL);
+				sacSum = ((sacRes2) <<16) | ((sacRes1) & SAC_MASK);
+				printf("Sample: %u\n", cSample);
+				printf("Sample 1 Result: %lld\n", sacRes1);
+				printf("Sample 2 Result: %lld\n", sacRes1);
+				printf("Sum of Samples: %lld\n", sacSum);
+
+				k_sleep(K_MSEC(5000));
+				DL_MathACL_clearResults(MATHACL);
 		}
 	}
 	return 0;
 }
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////
+//setSTART(true);
+//
+//	while (1) {
+//		rnd = rand() % 4096 + 1;
+//		if (sampleCounter > 0) { 			// Have we collected all samples in window?
+//			if(dataReady){ 					// wait for data to be ready from the ADC
+//				dataReady = false;			// reset until callback indicates data is ready
+//
+//				cSample = rnd; 				// push uint16_t sample value from callback into local buffer
+//				sumSAMP += cSample; 		// add value to total sum for this window
+//				sampleCounter--;            // decrement the sample count
+//				sacSum = sacSum + (cSample * cSample);
+//				DL_MathACL_waitForOperation(MATHACL);
+//				DL_MathACL_configOperation(MATHACL, &gMACConfig, cSample, cSample);
+//				DL_MathACL_waitForOperation(MATHACL);
+//				sacRes1 = DL_MathACL_getResultOne(MATHACL);
+//				sacRes2 = DL_MathACL_getResultTwo(MATHACL);
+//				sacSum = ((sacRes2) <<16) | ((sacRes1) & SAC_MASK);
+//				printf("Sample: %u\n", cSample);
+//				printf("Sample 1 Result: %lld\n", sacRes1);
+//				printf("Sample 2 Result: %lld\n", sacRes1);
+//
+//				k_sleep(K_MSEC(5000));
+//				DL_MathACL_clearResults(MATHACL);
+//				if(cSample> vMAX){          // Set min and max values based on samples we have already taken
+//					vMAX = cSample;
+//				}else if(cSample<vMIN){
+//					vMIN = cSample;
+//				}
+//			} else{ //............		    //do nothing since data is not ready yet
+//			  }
+//		} else{
+//
+//			setSTART(false);				// now we have all samples, stop ADC sampling
+//			calculateResult();				// calculate results to be sent to display
+//			resetVars(); 					// Reset the variable values for next iteration
+//			gpio_pin_set_dt(&done, 1);
+//			k_sleep(K_MSEC(10000));
+//			setSTART(true); 				// Set up ADC for next window of sampling
+//			gpio_pin_set_dt(&done, 0);
+//		}
+//	}
