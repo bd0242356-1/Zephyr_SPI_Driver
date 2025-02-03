@@ -18,6 +18,7 @@
 #define NUM_SAMPLES 32//pow(2,SAMP_BITS)
 #define FULL_SCALE 5
 #define MAX_NUM pow(2,NUM_BITS)
+#define SPI_PACKET_SIZE 4
 
 const struct gpio_dt_spec reset = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, reset_gpios);
 const struct gpio_dt_spec start = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, start_gpios);
@@ -26,20 +27,21 @@ const struct gpio_dt_spec en = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, en_gpios);
 const struct gpio_dt_spec done = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, done_gpios);
 const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 const struct device *const dev = DEVICE_DT_GET(SPI_1_NODE);
-
 struct spi_cs_control cs_ctrl = (struct spi_cs_control){
 	.gpio = GPIO_DT_SPEC_GET(SPI_1_NODE, cs_gpios),
 	.delay = 0u,
 };
 
-uint8_t spiData[4] = {0x0000};
+uint8_t spiData[SPI_PACKET_SIZE] = {0x0,0x0,0x0,0x0};
 
 uint16_t adcRX, cSample;
-uint16_t sampleCounter;
+int sampleCounter;
 
-uint32_t sumSAMP;
-int32_t vMIN, vMAX, vDC, pk_pk,	vRMS;
+
+int32_t vMIN, vMAX, VDC, pk_pk,	vRMS;
 int32_t dataOutput[5] ;//= {0,0,0,0,0};
+
+int64_t sacSum, sumSAMP;
 
 bool  dataReady;
 
@@ -58,6 +60,8 @@ void setRESET(const bool state) {
 	printf("ADC Reset Request\n");
 	uint8_t value = (uint8_t)(state ? 1 : 0);
 	gpio_pin_set_dt(&reset, value);
+	//k_sleep(K_MSEC(500));
+	//gpio_pin_set_dt(&reset, 0);
 }
 
 void adcSetup(void){
@@ -69,19 +73,19 @@ void adcSetup(void){
 	printf("Setting up ADC...\n");
 	tmpBuffer = (uint8_t [4]){0x8, 0x5,0x0,0x3};
 	SPI_TRX(dev, &cs_ctrl, tmpBuffer);
-	k_sleep(K_MSEC(200));
+	k_sleep(K_MSEC(1000));
 
 	tmpBuffer = (uint8_t [4]){0x8, 0x6,0x0,0x8};
 	SPI_TRX(dev, &cs_ctrl, tmpBuffer);
-	k_sleep(K_MSEC(200));
+	k_sleep(K_MSEC(1000));
 
 	tmpBuffer = (uint8_t [4]){0x8, 0x7,0x0,0xB};
 	SPI_TRX(dev, &cs_ctrl, tmpBuffer);
-	k_sleep(K_MSEC(200));
+	k_sleep(K_MSEC(1000));
 
 	tmpBuffer = (uint8_t [4]){0x8, 0x8,0x0,0x8};
 	SPI_TRX(dev, &cs_ctrl, tmpBuffer);
-	k_sleep(K_MSEC(200));
+	k_sleep(K_MSEC(1000));
 
 	printf("Done Setting up ADC...\n");
 }// Get data from ADC
@@ -110,47 +114,52 @@ void SPI_TRX(const struct device *dev, struct spi_cs_control *cs, uint8_t packet
 
 	int ret = spi_transceive(dev, &config, &tx_set, &rx_set);
 
-	printf(" tx (i)  : %01x %01x %01x %01x \n",
-	       buff[0], buff[1], buff[2], buff[3]);
-	printf(" rx (i)  : %02x %02x \n",
-	       rxdata[0], rxdata[1]);
-    // Convert the 16 bit data from ADC into a UINT16_t value
-	adcRX = (uint16_t)(rxdata[0] << 8 | rxdata[1]);
 
+	printf(" tx (i)  : %x %x %x %x \n",
+	       buff[0], buff[1], buff[2], buff[3]);
+	printf(" rx (i)  : %x %x \n",
+	       rxdata[0], rxdata[1]);
+
+	// Convert the 16 bit data from ADC into a UINT16_t value
+	adcRX = (uint16_t)(rxdata[0] << 8 | rxdata[1]);
+	printf(" ADC Value : %d \n",adcRX);
 }
 
 void resetVars(void){
 	printf("Resetting Variable Values for Next Window\n");
-	vMIN =0;
-	vMAX = 0;
+	vMIN 	= MAX_NUM + 1;
+	vMAX 	= -MAX_NUM - 1;
 	sumSAMP = 0;
-	vRMS = 0;
-	vDC = 0;
-	pk_pk = 0;
+	sacSum  = 0;
+	pk_pk 	= 0;
 	sampleCounter = NUM_SAMPLES;
 }
 
 void calculateResult(void){
+	vRMS  = sqrt(sacSum >> SAMP_BITS) * FULL_SCALE;
+	VDC   = (sumSAMP >>SAMP_BITS) * FULL_SCALE;
+	vMIN  = vMIN * FULL_SCALE;
+	vMAX  = vMAX * FULL_SCALE;
+	pk_pk = vMAX - vMIN;
 
-	pk_pk 		  = vMAX - vMIN;
-	vRMS 		  = (sumSAMP / MAX_NUM)*sqrt(2);
+	dataOutput[0] =  vMIN;		// minimum voltage converted from ADC value to voltage
+	dataOutput[1] =  vMAX; 		// maximum voltage converted from ADC value to voltage
+	dataOutput[2] =  pk_pk;		// Pk-pk voltage from ADC value
+	dataOutput[3] =  VDC;		// DC voltage form ADC value
+	dataOutput[4] =  vRMS;    	// VRMS form ADC values * sqrt(2)
 
-	dataOutput[0] = ((vMIN/MAX_NUM) * FULL_SCALE); 		// minimum voltage converted from ADC value to voltage
-	dataOutput[1] = ((vMAX/MAX_NUM) * FULL_SCALE);   	// maximum voltage converted from ADC value to voltage
-	dataOutput[2] = ((pk_pk/MAX_NUM) * FULL_SCALE); 	// Pk-pk voltage from ADC value
-	dataOutput[3] = ((vDC/MAX_NUM) * FULL_SCALE);		// DC voltage form ADC value
-	dataOutput[4] = ((vRMS/MAX_NUM) * FULL_SCALE);      // VRMS form ADC values * sqrt(2)
-	printf("vMin: %4x vMax: %4x Vpk-pk: %4x VDC: %4x vRMS: %4x\n", dataOutput[0],
+	printf("vMin: %d vMax: %d Vpk-pk: %d VDC: %d vRMS: %d\n", dataOutput[0],
 	       dataOutput[1], dataOutput[2], dataOutput[3], dataOutput[4]);
+
 	k_sleep(K_MSEC(10000)); // just using for debug to keep output visible for 10 seconds
+	gpio_pin_set_dt(&done, 0); // done with this windo of data, toggle LED
 }
 
 void drdyEdge(const struct device *dev, struct gpio_callback *cb, uint32_t pins){
 	printf("Drdy Edge GPIO Call\n");
-	SPI_TRX(dev, &cs_ctrl, spiData);  // get data from the ADC and send to buffer
 	dataReady = true;
+	SPI_TRX(dev, &cs_ctrl, spiData);  // get data from the ADC and send to buffer
 }
-
 int main(void){
 
 	int ret;
@@ -185,35 +194,41 @@ int main(void){
 			return 0;
 		}
 
+
+	//gpio_pin_set_dt(&en, 1);
+	adcSetup();
+
 	gpio_init_callback(&drdy_cb_data, drdyEdge, BIT(drdy.pin));
 	gpio_add_callback(drdy.port, &drdy_cb_data);
-	printk("Set up DRDY at %s pin reset%d\n", drdy.port->name, drdy.pin);
+	printk("Set up DRDY at %s %d\n", drdy.port->name, drdy.pin);
 
-	adcSetup();
 	setSTART(true);
-
 	while (1) {
 
 		if (sampleCounter > 0) { 			// Have we collected all samples in window?
 			if(dataReady){ 					// wait for data to be ready from the ADC
 				dataReady = false;			// reset until callback indicates data is ready
+
 				cSample = adcRX; 			// push uint16_t sample value from callback into local buffer
 				sumSAMP += cSample; 		// add value to total sum for this window
 				sampleCounter--;            // decrement the sample count
+				sacSum = sacSum + (cSample * cSample);
 
 				if(cSample> vMAX){          // Set min and max values based on samples we have already taken
 					vMAX = cSample;
 				}else if(cSample<vMIN){
 					vMIN = cSample;
 				}
-			} else{ 						//do nothing since data is not ready yet
+			} else{ //............		    //do nothing since data is not ready yet
 			  }
 		} else{
+
 			setSTART(false);				// now we have all samples, stop ADC sampling
 			calculateResult();				// calculate results to be sent to display
 			resetVars(); 					// Reset the variable values for next iteration
 			k_sleep(K_MSEC(10000));
 			setSTART(true); 				// Set up ADC for next window of sampling
+			gpio_pin_set_dt(&done, 0);
 		}
 	}
 	return 0;
